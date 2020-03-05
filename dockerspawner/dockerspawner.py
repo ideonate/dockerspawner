@@ -11,6 +11,7 @@ from tarfile import TarFile, TarInfo
 from textwrap import dedent
 from urllib.parse import urlparse
 import warnings
+import escapism
 
 import docker
 from docker.errors import APIError
@@ -241,6 +242,27 @@ class DockerSpawner(Spawner):
 
     @default('options_form')
     def _default_options_form(self):
+        return """
+        <label for="apptype">Select an app type:</label>
+        <select class="form-control" name="apptype" required autofocus>
+        <option value="voila" selected>Voila</option>
+        <option value="streamlit" selected>Streamlit</option>
+        </select>
+        
+        <label for="repourl">Enter a repo URL:</label>
+        <input type="text" name="repourl" value="" />
+        """
+
+    def options_from_form(self, formdata):
+        """Turn options formdata into user_options"""
+        options = {}
+        if 'apptype' in formdata:
+            options['apptype'] = formdata['apptype'][0]
+        if 'repourl' in formdata:
+            options['repourl'] = formdata['repourl'][0]
+        return options
+
+    def _old_default_options_form(self):
         image_whitelist = self._get_image_whitelist()
         if len(image_whitelist) <= 1:
             # default form only when there are images to choose from
@@ -262,7 +284,7 @@ class DockerSpawner(Spawner):
             options=options
         )
 
-    def options_from_form(self, formdata):
+    def _old_options_from_form(self, formdata):
         """Turn options formdata into user_options"""
         options = {}
         if 'image' in formdata:
@@ -271,7 +293,7 @@ class DockerSpawner(Spawner):
 
     pull_policy = CaselessStrEnum(
         ["always", "ifnotpresent", "never"],
-        default_value="ifnotpresent",
+        default_value="never",
         config=True,
         help="""The policy for pulling the user docker image.
 
@@ -639,7 +661,7 @@ class DockerSpawner(Spawner):
             'cmd': self.post_start_cmd,
             'container': container_id
         }
-        
+
         exec_id = yield self.docker("exec_create", **exec_kwargs)
 
         return self.docker("exec_start", exec_id=exec_id)
@@ -766,6 +788,9 @@ class DockerSpawner(Spawner):
     def get_env(self):
         env = super().get_env()
         env['JUPYTER_IMAGE_SPEC'] = self.image
+        env['JUPYTERHUB_GROUP'] = 'danstreamlit'
+        print('GETTING ENV')
+        self.log.debug('GETTING ENV debug')
         return env
 
     def _docker(self, method, *args, **kwargs):
@@ -874,6 +899,46 @@ class DockerSpawner(Spawner):
         return ['DNS:' + self.internal_hostname]
 
     @gen.coroutine
+    def build_r2d(self, image, apptype, repourl):
+        # Should pull r2d image
+        r2d_image_name = "jupyter/repo2docker:0.10.0"
+
+        host_config = {
+            'binds': {
+                '/var/run/docker.sock': {
+                    'bind': '/var/run/docker.sock',
+                    'mode': 'rw',
+                }
+            }
+        }
+
+        self.log.debug("Starting host with config: %s", host_config)
+
+        host_config = self.client.create_host_config(**host_config)
+
+        container = yield self.docker('create_container',
+                                      image=r2d_image_name,
+                                      host_config=host_config,
+                                      command=['repo2docker', '--no-run', '--image-name', image,
+                                               '--user-name=jovyan', '--user-id=1000', repourl])
+
+        container_id = container['Id']
+
+        yield self.docker('start', container_id)
+
+        self.log.debug(
+            "r2d Container %s for %s",
+            container_id[:12], self._log_name,
+        )
+
+        yield self.docker('wait', container_id)
+
+        self.log.debug(
+            "Awaited r2d Container %s for %s",
+            container_id[:12], self._log_name,
+        )
+
+    @gen.coroutine
     def create_object(self):
         """Create the container/service object"""
 
@@ -941,7 +1006,7 @@ class DockerSpawner(Spawner):
         """
         # docker wants to split repo:tag
         # the part split("/")[-1] allows having an image from a custom repo
-        # with port but without tag. For example: my.docker.repo:51150/foo would not 
+        # with port but without tag. For example: my.docker.repo:51150/foo would not
         # pass this test, resulting in image=my.docker.repo:51150/foo and tag=latest
         if ':' in image.split("/")[-1]:
             # rsplit splits from right to left, allowing to have a custom image repo with port
@@ -1002,8 +1067,16 @@ class DockerSpawner(Spawner):
             # save choice in self.image
             self.image = yield self.check_image_whitelist(image_option)
 
-        image = self.image
-        yield self.pull_image(image)
+        #image = self.image
+        repourl = self.user_options.get('repourl')
+        apptype = self.user_options.get('apptype')
+        self.image = image = "r2d" + escapism.escape(repourl, escape_char="-").lower()
+
+        try:
+            yield self.pull_image(image)
+        except docker.errors.NotFound:
+            # Need to build
+            yield self.build_r2d(image, apptype, repourl)
 
         obj = yield self.get_object()
         if obj and self.remove:
