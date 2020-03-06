@@ -12,6 +12,8 @@ from textwrap import dedent
 from urllib.parse import urlparse
 import warnings
 import escapism
+from async_generator import async_generator, yield_
+from asyncio import sleep
 
 import docker
 from docker.errors import APIError
@@ -56,6 +58,8 @@ class DockerSpawner(Spawner):
     """A Spawner for JupyterHub that runs each user's server in a separate docker container"""
 
     _executor = None
+
+    log_generator = None
 
     @property
     def executor(self):
@@ -900,8 +904,11 @@ class DockerSpawner(Spawner):
 
     @gen.coroutine
     def build_r2d(self, image, apptype, repourl):
-        # Should pull r2d image
+
         r2d_image_name = "jupyter/repo2docker:0.10.0"
+
+        self.pull_policy = 'ifnotpresent'
+        self.pull_image(r2d_image_name)
 
         host_config = {
             'binds': {
@@ -912,7 +919,7 @@ class DockerSpawner(Spawner):
             }
         }
 
-        self.log.debug("Starting host with config: %s", host_config)
+        self.log.info("Starting host with config: %s", host_config)
 
         host_config = self.client.create_host_config(**host_config)
 
@@ -924,19 +931,70 @@ class DockerSpawner(Spawner):
 
         container_id = container['Id']
 
-        yield self.docker('start', container_id)
+        self.docker('start', container_id)
 
-        self.log.debug(
+        self.log.info(
             "r2d Container %s for %s",
             container_id[:12], self._log_name,
         )
 
-        yield self.docker('wait', container_id)
+        self.log_generator = self.docker('logs', container_id, stream=True, follow=True)
 
-        self.log.debug(
-            "Awaited r2d Container %s for %s",
-            container_id[:12], self._log_name,
+        retval = yield self.docker('wait', container_id)
+
+        self.log_generator = None
+
+        statuscode = retval['StatusCode']
+
+        self.log.info(
+            "Awaited r2d Container %s for %s StatusCode %d",
+            container_id[:12], self._log_name, statuscode
         )
+
+    @async_generator
+    async def _hide_progress(self):
+        """
+        This function is reporting back the progress of spawning a pod until
+        self._start_future has fired.
+        This is working with events parsed by the python kubernetes client,
+        and here is the specification of events that is relevant to understand:
+        ref: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.16/#event-v1-core
+        """
+
+        self.log.debug('progress generator')
+
+        spawn_future = self._spawn_future
+
+        break_while_loop = False
+        progress = 0
+        while True:
+            if spawn_future.done():
+                 break_while_loop = True
+
+            if self.log_generator:
+
+                for logline in await self.log_generator:
+                    # move the progress bar.
+                    # Since we don't know how many events we will get,
+                    # asymptotically approach 90% completion with each event.
+                    # each event gets 33% closer to 90%:
+                    # 30 50 63 72 78 82 84 86 87 88 88 89
+                    progress += (90 - progress) / 3
+
+                    # V1Event isn't serializable, and neither is the datetime
+                    # objects within it, and we need what we pass back to be
+                    # serializable to it can be sent back from JupyterHub to
+                    # a browser wanting to display progress.
+
+                    await yield_({
+                        'progress': int(progress),
+                        #'raw_event': ''serializable_event'',
+                        'message':  logline
+                    })
+
+            if break_while_loop:
+                break
+            await sleep(1)
 
     @gen.coroutine
     def create_object(self):
@@ -1071,8 +1129,14 @@ class DockerSpawner(Spawner):
         repourl = self.user_options.get('repourl')
         apptype = self.user_options.get('apptype')
         self.image = image = "r2d" + escapism.escape(repourl, escape_char="-").lower()
+        self.cmd = 'jupyterhub-singleuser'
+
+        self.pull_policy = 'ifnotpresent'
+
+        #yield self.pull_image(image)
 
         try:
+            self.pull_policy = 'never'
             yield self.pull_image(image)
         except docker.errors.NotFound:
             # Need to build
@@ -1102,6 +1166,7 @@ class DockerSpawner(Spawner):
             )
 
         else:
+
             self.log.info(
                 "Found existing %s %s (id: %s)",
                 self.object_type,
