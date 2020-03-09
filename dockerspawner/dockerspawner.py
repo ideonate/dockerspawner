@@ -916,7 +916,8 @@ class DockerSpawner(Spawner):
                     'bind': '/var/run/docker.sock',
                     'mode': 'rw',
                 }
-            }
+            },
+            'auto_remove': True
         }
 
         self.log.info("Starting host with config: %s", host_config)
@@ -938,7 +939,7 @@ class DockerSpawner(Spawner):
             container_id[:12], self._log_name,
         )
 
-        self.log_generator = self.docker('logs', container_id, stream=True, follow=True)
+        self.log_generator = yield self.docker('logs', container_id, stream=True, follow=True)
 
         retval = yield self.docker('wait', container_id)
 
@@ -952,7 +953,7 @@ class DockerSpawner(Spawner):
         )
 
     @async_generator
-    async def _hide_progress(self):
+    async def progress(self):
         """
         This function is reporting back the progress of spawning a pod until
         self._start_future has fired.
@@ -973,7 +974,9 @@ class DockerSpawner(Spawner):
 
             if self.log_generator:
 
-                for logline in await self.log_generator:
+                i = 0
+
+                for logline in self.log_generator:
                     # move the progress bar.
                     # Since we don't know how many events we will get,
                     # asymptotically approach 90% completion with each event.
@@ -986,11 +989,16 @@ class DockerSpawner(Spawner):
                     # serializable to it can be sent back from JupyterHub to
                     # a browser wanting to display progress.
 
+                    self.log.debug(str(logline))
+                    self.log.debug(str(logline.decode("utf-8") ))
+
                     await yield_({
                         'progress': int(progress),
-                        #'raw_event': ''serializable_event'',
-                        'message':  logline
+                        'raw_event': logline.decode("utf-8"),
+                        'message': 'logline '+str(i)+' '+logline.decode("utf-8")
                     })
+
+                    i = i + 1
 
             if break_while_loop:
                 break
