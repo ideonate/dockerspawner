@@ -15,6 +15,8 @@ import escapism
 from async_generator import async_generator, yield_
 from asyncio import sleep
 
+from collections import deque
+
 import docker
 from docker.errors import APIError
 from docker.utils import kwargs_from_env
@@ -939,11 +941,15 @@ class DockerSpawner(Spawner):
             container_id[:12], self._log_name,
         )
 
-        self.log_generator = yield self.docker('logs', container_id, stream=True, follow=True)
+        #self.log_generator = yield self.docker('logs', container_id, stream=True, follow=True)
 
-        retval = yield self.docker('wait', container_id)
+        #retval = yield self.docker('wait', container_id)
 
-        self.log_generator = None
+        #self.log_generator = None
+
+
+        log_gen = yield self.docker('logs', container_id, stream=True, follow=True)
+        retval = yield self.wrap_follow_logs(container_id, log_gen)
 
         statuscode = retval['StatusCode']
 
@@ -951,6 +957,38 @@ class DockerSpawner(Spawner):
             "Awaited r2d Container %s for %s StatusCode %d",
             container_id[:12], self._log_name, statuscode
         )
+
+    def wrap_follow_logs(self, container_id, log_gen):
+        return self.executor.submit(self.follow_logs, container_id, log_gen)
+
+    def follow_logs(self, container_id, log_gen):
+
+        class MyLogGen(object):
+
+            def __init__(self):
+                self.loglines = deque([])
+
+            def __next__(self):
+                try:
+                    return self.loglines.popleft()
+                except IndexError as e:
+                    return
+
+            def __iter__(self):
+                return self
+
+            def push(self, logline):
+                self.loglines.append(logline)
+
+        self.log_generator = MyLogGen()
+
+        for logline in log_gen:
+            l = logline.decode('utf-8')
+            self.log.info(l)
+            self.log_generator.push('From follow: '+l)
+
+        self.log.info('Returning follow_logs')
+        return {'StatusCode': 0}
 
     @async_generator
     async def progress(self):
@@ -962,19 +1000,22 @@ class DockerSpawner(Spawner):
         ref: https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.16/#event-v1-core
         """
 
-        self.log.debug('progress generator')
-
         spawn_future = self._spawn_future
 
         break_while_loop = False
         progress = 0
         while True:
+            self.log.debug('progress generator')
+
             if spawn_future.done():
-                 break_while_loop = True
+                self.log.debug('progress generator BREAK spawn_future.done')
+                break_while_loop = True
 
             if self.log_generator:
 
                 i = 0
+
+                self.log.debug('START LOOP progress generator')
 
                 for logline in self.log_generator:
                     # move the progress bar.
@@ -990,19 +1031,23 @@ class DockerSpawner(Spawner):
                     # a browser wanting to display progress.
 
                     self.log.debug(str(logline))
-                    self.log.debug(str(logline.decode("utf-8") ))
 
                     await yield_({
                         'progress': int(progress),
-                        'raw_event': logline.decode("utf-8"),
-                        'message': 'logline '+str(i)+' '+logline.decode("utf-8")
+                        'raw_event': logline,
+                        'message': 'logline '+str(i)+' '+logline
                     })
 
                     i = i + 1
 
+                self.log.debug('END LOOP progress generator')
+
             if break_while_loop:
+                self.log.debug('BREAK LOOP progress generator')
                 break
+
             await sleep(1)
+            self.log.debug('AWAIT SLEEP progress generator')
 
     @gen.coroutine
     def create_object(self):
