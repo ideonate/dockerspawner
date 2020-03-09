@@ -930,7 +930,29 @@ class DockerSpawner(Spawner):
     @gen.coroutine
     def build_r2d(self, repourl, ref):
 
+        class MyLogGen(object):
+            # Really need to take care of buffer filling up
+
+            def __init__(self):
+                self.loglines = deque([])
+
+            def __next__(self):
+                try:
+                    return self.loglines.popleft()
+                except IndexError as e:
+                    return
+
+            def __iter__(self):
+                return self
+
+            def push(self, progress, logline):
+                self.loglines.append({'progress': int(progress), 'message': logline})
+
+        self.log_generator = MyLogGen()
+
         r2d_image_name = "jupyter/repo2docker:0.10.0"
+
+        self.log_generator.push(1, 'Creating repo2docker container {} for repo {} and ref {}'.format(r2d_image_name, repourl, ref))
 
         old_pull_policy = self.pull_policy
         self.pull_policy = 'ifnotpresent'
@@ -965,6 +987,8 @@ class DockerSpawner(Spawner):
 
         container_id = container['Id']
 
+        self.log_generator.push(1, 'Starting repo2docker container')
+
         self.docker('start', container_id)
 
         self.log.info(
@@ -972,53 +996,35 @@ class DockerSpawner(Spawner):
             container_id[:12], self._log_name,
         )
 
-        log_gen = yield self.docker('logs', container_id, stream=True, follow=True)
-        retval = yield self.wrap_follow_logs(container_id, log_gen)
+        self.log_generator.push(1, 'Connecting to repo2docker container logs')
+
+        docker_log_gen = yield self.docker('logs', container_id, stream=True, follow=True)
+        image_name = yield self.wrap_follow_logs(docker_log_gen)
+
+        retval = yield self.docker('wait', container_id)
 
         statuscode = retval['StatusCode']
-        image_name = retval['image_name']
-
-        if statuscode == 0 and image_name == '':
-            raise Exception('repo2docker did not provide a name for the image within its logs')
 
         self.log.info(
             "Awaited r2d Container %s for %s StatusCode %d",
             container_id[:12], self._log_name, statuscode
         )
 
+        if statuscode == 0 and image_name == '':
+            raise Exception('repo2docker did not provide a name for the image within its logs')
+
         return image_name
 
-    def wrap_follow_logs(self, container_id, log_gen):
-        return self.executor.submit(self.follow_logs, container_id, log_gen)
+    def wrap_follow_logs(self, docker_log_gen):
+        return self.executor.submit(self.follow_logs, docker_log_gen)
 
-    def follow_logs(self, container_id, log_gen):
+    def follow_logs(self, docker_log_gen):
 
         step_regex = re.compile(r'^Step (\d+)/(\d+) : .*')
         tag_regex = re.compile(r'^Successfully tagged (([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*)(:([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*))?)\n?$')
         reuse_regex = re.compile(r'^Reusing existing image \((([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*)(:([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*))?)\), not building')
 
         image_name = ''
-
-        class MyLogGen(object):
-
-            # Really need to take care of buffer filling up
-
-            def __init__(self):
-                self.loglines = deque([])
-
-            def __next__(self):
-                try:
-                    return self.loglines.popleft()
-                except IndexError as e:
-                    return
-
-            def __iter__(self):
-                return self
-
-            def push(self, progress, logline):
-                self.loglines.append({'progress': int(progress), 'message': logline})
-
-        self.log_generator = MyLogGen()
 
         # For progress, take 0-5% as the bit before we get any STEP message
         # 5-95 is spread between the STEPS (once we know how many steps)
@@ -1028,10 +1034,10 @@ class DockerSpawner(Spawner):
 
         (curstep, maxstep) = (0, 0)
 
-        progress = 0
+        progress = 1
         next_progress_ceil = step_0_pct
 
-        for logline in log_gen:
+        for logline in docker_log_gen:
             l = logline.decode('utf-8')
 
             # May get progress lines such as Step 3/10 : ....
@@ -1068,7 +1074,7 @@ class DockerSpawner(Spawner):
             self.log.info(l)
             self.log_generator.push(progress, l)
 
-        return {'StatusCode': 0, 'image_name': image_name}
+        return image_name
 
     @async_generator
     async def progress(self):
