@@ -966,7 +966,7 @@ class DockerSpawner(Spawner):
                     'mode': 'rw',
                 }
             },
-            'auto_remove': True
+            'auto_remove': False
         }
 
         self.log.info("Starting host with config: %s", host_config)
@@ -983,7 +983,8 @@ class DockerSpawner(Spawner):
         container = yield self.docker('create_container',
                                       image=r2d_image_name,
                                       host_config=host_config,
-                                      command=r2d_cmd)
+                                      command=r2d_cmd,
+                                      environment=['PYTHONUNBUFFERED=1']) # Try to ensure all logs make it through
 
         container_id = container['Id']
 
@@ -1004,6 +1005,11 @@ class DockerSpawner(Spawner):
         retval = yield self.docker('wait', container_id)
 
         statuscode = retval['StatusCode']
+
+
+        # Look at tail logs if needed TODO
+
+        yield self.docker('remove_container', container_id)
 
         self.log.info(
             "Awaited r2d Container %s for %s StatusCode %d",
