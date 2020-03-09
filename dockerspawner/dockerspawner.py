@@ -15,6 +15,7 @@ import escapism
 from async_generator import async_generator, yield_
 from asyncio import sleep
 
+import re
 from collections import deque
 
 import docker
@@ -905,12 +906,14 @@ class DockerSpawner(Spawner):
         return ['DNS:' + self.internal_hostname]
 
     @gen.coroutine
-    def build_r2d(self, image, apptype, repourl):
+    def build_r2d(self, repourl, ref):
 
         r2d_image_name = "jupyter/repo2docker:0.10.0"
 
+        old_pull_policy = self.pull_policy
         self.pull_policy = 'ifnotpresent'
         self.pull_image(r2d_image_name)
+        self.pull_policy = old_pull_policy
 
         host_config = {
             'binds': {
@@ -926,11 +929,17 @@ class DockerSpawner(Spawner):
 
         host_config = self.client.create_host_config(**host_config)
 
+        r2d_cmd = ['repo2docker', '--no-run']
+
+        if ref:
+            r2d_cmd.extend(['--ref', ref])
+
+        r2d_cmd.extend(['--user-name=jovyan', '--user-id=1000', repourl])
+
         container = yield self.docker('create_container',
                                       image=r2d_image_name,
                                       host_config=host_config,
-                                      command=['repo2docker', '--no-run', '--image-name', image,
-                                               '--user-name=jovyan', '--user-id=1000', repourl])
+                                      command=r2d_cmd)
 
         container_id = container['Id']
 
@@ -941,29 +950,35 @@ class DockerSpawner(Spawner):
             container_id[:12], self._log_name,
         )
 
-        #self.log_generator = yield self.docker('logs', container_id, stream=True, follow=True)
-
-        #retval = yield self.docker('wait', container_id)
-
-        #self.log_generator = None
-
-
         log_gen = yield self.docker('logs', container_id, stream=True, follow=True)
         retval = yield self.wrap_follow_logs(container_id, log_gen)
 
         statuscode = retval['StatusCode']
+        image_name = retval['image_name']
+
+        if statuscode == 0 and image_name == '':
+            raise Exception('repo2docker did not provide a name for the image within its logs')
 
         self.log.info(
             "Awaited r2d Container %s for %s StatusCode %d",
             container_id[:12], self._log_name, statuscode
         )
 
+        return image_name
+
     def wrap_follow_logs(self, container_id, log_gen):
         return self.executor.submit(self.follow_logs, container_id, log_gen)
 
     def follow_logs(self, container_id, log_gen):
 
+        step_regex = re.compile(r'^Step (\d+)/(\d+) : .*')
+        tag_regex = re.compile(r'Successfully tagged ([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*)(:([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*))\n?$')
+
+        image_name = ''
+
         class MyLogGen(object):
+
+            # Really need to take care of buffer filling up
 
             def __init__(self):
                 self.loglines = deque([])
@@ -977,18 +992,59 @@ class DockerSpawner(Spawner):
             def __iter__(self):
                 return self
 
-            def push(self, logline):
-                self.loglines.append(logline)
+            def push(self, progress, logline):
+                self.loglines.append({'progress': int(progress), 'message': logline})
 
         self.log_generator = MyLogGen()
 
+        # For progress, take 0-5% as the bit before we get any STEP message
+        # 5-95 is spread between the STEPS (once we know how many steps)
+        # within each block, each new logline pushes us asymptotically closer to the next bar
+        step_0_pct = 5
+        step_end_pct = 95
+
+        (curstep, maxstep) = (0, 0)
+
+        progress = 0
+        next_progress_ceil = step_0_pct
+
         for logline in log_gen:
             l = logline.decode('utf-8')
+
+            # May get progress lines such as Step 3/10 : ....
+            # or at end: Successfully tagged r2dhttps-3a-2f-2fgithub-2ecom-2fdanlester-2fr2d-2dskeleton:latest\n
+
+            m = step_regex.match(l)
+            if m:
+                (curstep, maxstep) = m.groups()
+                self.log.info('NOW at {} of {}'.format(curstep, maxstep))
+
+                (curstep, maxstep) = (int(curstep), int(maxstep))
+
+                if maxstep == 0:
+                    maxstep = 1
+
+                progress = (curstep - 1) * ( (step_end_pct - step_0_pct) / maxstep ) + step_0_pct
+
+                next_progress_ceil = curstep * ( (step_end_pct - step_0_pct) / maxstep ) + step_0_pct
+
+            else:
+                # Since we don't know how many events we will get,
+                # asymptotically approach 90% completion with each event.
+                # each event gets 33% closer to 90%:
+                # 30 50 63 72 78 82 84 86 87 88 88 89
+                progress += (next_progress_ceil - progress) / 3
+
+            m = tag_regex.match(l)
+            if m:
+                image_name = m.group(1)
+                self.log.info('FOUND IMAGE NAME: '+image_name)
+
             self.log.info(l)
-            self.log_generator.push('From follow: '+l)
+            self.log_generator.push(progress, 'From follow: '+l)
 
         self.log.info('Returning follow_logs')
-        return {'StatusCode': 0}
+        return {'StatusCode': 0, 'image_name': image_name}
 
     @async_generator
     async def progress(self):
@@ -1017,28 +1073,15 @@ class DockerSpawner(Spawner):
 
                 self.log.debug('START LOOP progress generator')
 
-                for logline in self.log_generator:
-                    # move the progress bar.
-                    # Since we don't know how many events we will get,
-                    # asymptotically approach 90% completion with each event.
-                    # each event gets 33% closer to 90%:
-                    # 30 50 63 72 78 82 84 86 87 88 88 89
-                    progress += (90 - progress) / 3
+                for logdict in self.log_generator:
+                    if logdict is None:
+                        await sleep(1)
+                    else:
+                        self.log.debug(str(logdict))
 
-                    # V1Event isn't serializable, and neither is the datetime
-                    # objects within it, and we need what we pass back to be
-                    # serializable to it can be sent back from JupyterHub to
-                    # a browser wanting to display progress.
+                        await yield_(logdict)
 
-                    self.log.debug(str(logline))
-
-                    await yield_({
-                        'progress': int(progress),
-                        'raw_event': logline,
-                        'message': 'logline '+str(i)+' '+logline
-                    })
-
-                    i = i + 1
+                        i = i + 1
 
                 self.log.debug('END LOOP progress generator')
 
@@ -1181,19 +1224,24 @@ class DockerSpawner(Spawner):
         #image = self.image
         repourl = self.user_options.get('repourl')
         apptype = self.user_options.get('apptype')
-        self.image = image = "r2d" + escapism.escape(repourl, escape_char="-").lower()
-        self.cmd = 'jupyterhub-singleuser'
+        #self.image = image = "r2d" + escapism.escape(repourl, escape_char="-").lower()
 
-        self.pull_policy = 'ifnotpresent'
+        self.cmd = 'jupyterhub-singleuser'
 
         #yield self.pull_image(image)
 
-        try:
-            self.pull_policy = 'never'
-            yield self.pull_image(image)
-        except docker.errors.NotFound:
-            # Need to build
-            yield self.build_r2d(image, apptype, repourl)
+        ref = ''
+
+        self.image = yield self.build_r2d(repourl, ref)
+
+        #try:
+        #    old_pull_policy = self.pull_policy
+        #    self.pull_policy = 'never'
+        #    yield self.pull_image(image)
+        #    self.pull_policy = old_pull_policy
+        #except docker.errors.NotFound:
+        #    # Need to build
+        #    yield self.build_r2d(repourl, ref)
 
         obj = yield self.get_object()
         if obj and self.remove:
