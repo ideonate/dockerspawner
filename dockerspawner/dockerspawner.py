@@ -250,23 +250,45 @@ class DockerSpawner(Spawner):
     @default('options_form')
     def _default_options_form(self):
         return """
-        <label for="apptype">Select an app type:</label>
-        <select class="form-control" name="apptype" required autofocus>
-        <option value="voila" selected>Voila</option>
-        <option value="streamlit" selected>Streamlit</option>
-        </select>
         
-        <label for="repourl">Enter a repo URL:</label>
+        <input type="radio" id="use_r2d_yes" name="use_r2d" value="yes" checked>
+        <label for="use_r2d_yes">Start server from a repository</label> <br />
+
+        <label for="repourl">Repo URL:</label>
         <input type="text" name="repourl" value="" />
+        
+        </input>
+        
+        <br />
+        
+        <label for="reporef">Tag:</label>
+        <input type="text" name="reporef" value="" />
+        
+        <br />
+        <br />
+        
+        <input type="radio" id="use_r2d_no" name="use_r2d" value="no">
+        <label for="use_r2d_no">Start an empty server</label> 
+        </input>
+        
+        <br />
+        <br />
+        
         """
 
     def options_from_form(self, formdata):
         """Turn options formdata into user_options"""
         options = {}
-        if 'apptype' in formdata:
-            options['apptype'] = formdata['apptype'][0]
+
         if 'repourl' in formdata:
             options['repourl'] = formdata['repourl'][0]
+
+        if 'reporef' in formdata:
+            options['reporef'] = formdata['reporef'][0]
+
+        if 'use_r2d' in formdata:
+            options['use_r2d'] = formdata['use_r2d'][0]
+
         return options
 
     def _old_default_options_form(self):
@@ -972,7 +994,8 @@ class DockerSpawner(Spawner):
     def follow_logs(self, container_id, log_gen):
 
         step_regex = re.compile(r'^Step (\d+)/(\d+) : .*')
-        tag_regex = re.compile(r'Successfully tagged ([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*)(:([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*))\n?$')
+        tag_regex = re.compile(r'^Successfully tagged (([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*)(:([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*))?)\n?$')
+        reuse_regex = re.compile(r'^Reusing existing image \((([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*)(:([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*))?)\), not building')
 
         image_name = ''
 
@@ -1036,14 +1059,15 @@ class DockerSpawner(Spawner):
                 progress += (next_progress_ceil - progress) / 3
 
             m = tag_regex.match(l)
+            if not m:
+                m = reuse_regex.match(l)
             if m:
                 image_name = m.group(1)
                 self.log.info('FOUND IMAGE NAME: '+image_name)
 
             self.log.info(l)
-            self.log_generator.push(progress, 'From follow: '+l)
+            self.log_generator.push(progress, l)
 
-        self.log.info('Returning follow_logs')
         return {'StatusCode': 0, 'image_name': image_name}
 
     @async_generator
@@ -1221,27 +1245,20 @@ class DockerSpawner(Spawner):
             # save choice in self.image
             self.image = yield self.check_image_whitelist(image_option)
 
-        #image = self.image
-        repourl = self.user_options.get('repourl')
-        apptype = self.user_options.get('apptype')
-        #self.image = image = "r2d" + escapism.escape(repourl, escape_char="-").lower()
+        use_r2d = self.user_options.get('use_r2d')
 
-        self.cmd = 'jupyterhub-singleuser'
+        if use_r2d == 'yes':
 
-        #yield self.pull_image(image)
+            repourl = self.user_options.get('repourl')
+            ref = self.user_options.get('reporef')
 
-        ref = ''
+            self.cmd = 'jupyterhub-singleuser'
 
-        self.image = yield self.build_r2d(repourl, ref)
+            self.image = yield self.build_r2d(repourl, ref)
 
-        #try:
-        #    old_pull_policy = self.pull_policy
-        #    self.pull_policy = 'never'
-        #    yield self.pull_image(image)
-        #    self.pull_policy = old_pull_policy
-        #except docker.errors.NotFound:
-        #    # Need to build
-        #    yield self.build_r2d(repourl, ref)
+        else:
+
+            yield self.pull_image(self.image)
 
         obj = yield self.get_object()
         if obj and self.remove:
