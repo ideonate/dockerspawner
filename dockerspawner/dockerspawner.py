@@ -984,7 +984,7 @@ class DockerSpawner(Spawner):
                                       image=r2d_image_name,
                                       host_config=host_config,
                                       command=r2d_cmd,
-                                      environment=['PYTHONUNBUFFERED=1']) # Try to ensure all logs make it through
+                                      environment={'PYTHONUNBUFFERED': '0'}) # Try to ensure all logs make it through
 
         container_id = container['Id']
 
@@ -999,6 +999,7 @@ class DockerSpawner(Spawner):
 
         self.log_generator.push(1, 'Connecting to repo2docker container logs')
 
+        # Track logs pretty much to the end, but the stream might break before truly finished
         docker_log_gen = yield self.docker('logs', container_id, stream=True, follow=True)
         image_name = yield self.wrap_follow_logs(docker_log_gen)
 
@@ -1006,8 +1007,12 @@ class DockerSpawner(Spawner):
 
         statuscode = retval['StatusCode']
 
-
-        # Look at tail logs if needed TODO
+        if statuscode == 0 and image_name == '':
+            self.log.info('TRYING TAIL LOGS to get image name')
+            # We didn't pick up an image name, so try again with fixed logs at the end
+            docker_log_gen = yield self.docker('logs', container_id, stream=False, follow=False, tail=5)
+            docker_log_gen = docker_log_gen.decode('utf-8').split("\n")
+            image_name = yield self.wrap_follow_logs(docker_log_gen, track_progress=False)
 
         yield self.docker('remove_container', container_id)
 
@@ -1021,10 +1026,10 @@ class DockerSpawner(Spawner):
 
         return image_name
 
-    def wrap_follow_logs(self, docker_log_gen):
-        return self.executor.submit(self.follow_logs, docker_log_gen)
+    def wrap_follow_logs(self, docker_log_gen, track_progress=True):
+        return self.executor.submit(self.follow_logs, docker_log_gen, track_progress)
 
-    def follow_logs(self, docker_log_gen):
+    def follow_logs(self, docker_log_gen, track_progress=True):
 
         step_regex = re.compile(r'^Step (\d+)/(\d+) : .*')
         tag_regex = re.compile(r'^Successfully tagged (([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*)(:([a-z0-9]+(?:[._-]{1,2}[a-z0-9]+)*))?)\n?$')
@@ -1044,41 +1049,46 @@ class DockerSpawner(Spawner):
         next_progress_ceil = step_0_pct
 
         for logline in docker_log_gen:
-            l = logline.decode('utf-8')
 
-            # May get progress lines such as Step 3/10 : ....
-            # or at end: Successfully tagged r2dhttps-3a-2f-2fgithub-2ecom-2fdanlester-2fr2d-2dskeleton:latest\n
+            if track_progress:
+               logline = logline.decode('utf-8')
 
-            m = step_regex.match(l)
-            if m:
-                (curstep, maxstep) = m.groups()
-                self.log.info('NOW at {} of {}'.format(curstep, maxstep))
+            self.log.info(logline)
 
-                (curstep, maxstep) = (int(curstep), int(maxstep))
+            if track_progress:
+                # May get progress lines such as Step 3/10 : ....
+                # or at end: Successfully tagged r2dhttps-3a-2f-2fgithub-2ecom-2fdanlester-2fr2d-2dskeleton:latest\n
 
-                if maxstep == 0:
-                    maxstep = 1
+                m = step_regex.match(logline)
+                if m:
+                    (curstep, maxstep) = m.groups()
+                    self.log.info('NOW at {} of {}'.format(curstep, maxstep))
 
-                progress = (curstep - 1) * ( (step_end_pct - step_0_pct) / maxstep ) + step_0_pct
+                    (curstep, maxstep) = (int(curstep), int(maxstep))
 
-                next_progress_ceil = curstep * ( (step_end_pct - step_0_pct) / maxstep ) + step_0_pct
+                    if maxstep == 0:
+                        maxstep = 1
 
-            else:
-                # Since we don't know how many events we will get,
-                # asymptotically approach 90% completion with each event.
-                # each event gets 33% closer to 90%:
-                # 30 50 63 72 78 82 84 86 87 88 88 89
-                progress += (next_progress_ceil - progress) / 3
+                    progress = (curstep - 1) * ( (step_end_pct - step_0_pct) / maxstep ) + step_0_pct
 
-            m = tag_regex.match(l)
+                    next_progress_ceil = curstep * ( (step_end_pct - step_0_pct) / maxstep ) + step_0_pct
+
+                else:
+                    # Since we don't know how many events we will get,
+                    # asymptotically approach 90% completion with each event.
+                    # each event gets 33% closer to 90%:
+                    # 30 50 63 72 78 82 84 86 87 88 88 89
+                    progress += (next_progress_ceil - progress) / 3
+
+            m = tag_regex.match(logline)
             if not m:
-                m = reuse_regex.match(l)
+                m = reuse_regex.match(logline)
             if m:
                 image_name = m.group(1)
                 self.log.info('FOUND IMAGE NAME: '+image_name)
 
-            self.log.info(l)
-            self.log_generator.push(progress, l)
+            if track_progress:
+                self.log_generator.push(progress, logline)
 
         return image_name
 
@@ -1113,7 +1123,7 @@ class DockerSpawner(Spawner):
                     if logdict is None:
                         await sleep(1)
                     else:
-                        self.log.debug(str(logdict))
+                        #self.log.debug(str(logdict))
 
                         await yield_(logdict)
 
