@@ -291,35 +291,6 @@ class DockerSpawner(Spawner):
 
         return options
 
-    def _old_default_options_form(self):
-        image_whitelist = self._get_image_whitelist()
-        if len(image_whitelist) <= 1:
-            # default form only when there are images to choose from
-            return ''
-        # form derived from wrapspawner.ProfileSpawner
-        option_t = '<option value="{image}" {selected}>{image}</option>'
-        options = [
-            option_t.format(
-                image=image, selected='selected' if image == self.image else ''
-            )
-            for image in image_whitelist
-        ]
-        return """
-        <label for="image">Select an image:</label>
-        <select class="form-control" name="image" required autofocus>
-        {options}
-        </select>
-        """.format(
-            options=options
-        )
-
-    def _old_options_from_form(self, formdata):
-        """Turn options formdata into user_options"""
-        options = {}
-        if 'image' in formdata:
-            options['image'] = formdata['image'][0]
-        return options
-
     pull_policy = CaselessStrEnum(
         ["always", "ifnotpresent", "never"],
         default_value="never",
@@ -1001,7 +972,12 @@ class DockerSpawner(Spawner):
 
         # Track logs pretty much to the end, but the stream might break before truly finished
         docker_log_gen = yield self.docker('logs', container_id, stream=True, follow=True)
+
+        self.log.info('Got docker log gen')
+
         image_name = yield self.wrap_follow_logs(docker_log_gen)
+
+        self.log.info('Returned wrap_follow_logs')
 
         retval = yield self.docker('wait', container_id)
 
@@ -1027,6 +1003,7 @@ class DockerSpawner(Spawner):
         return image_name
 
     def wrap_follow_logs(self, docker_log_gen, track_progress=True):
+        # Maybe too lightweight, and certainly doesn't need to make docker calls on yet another thread
         return self.executor.submit(self.follow_logs, docker_log_gen, track_progress)
 
     def follow_logs(self, docker_log_gen, track_progress=True):
