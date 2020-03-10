@@ -2,7 +2,7 @@
 A Spawner for JupyterHub that runs each user's server in a separate docker container
 """
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from io import BytesIO
 import os
 from pprint import pformat
@@ -11,7 +11,6 @@ from tarfile import TarFile, TarInfo
 from textwrap import dedent
 from urllib.parse import urlparse
 import warnings
-import escapism
 from async_generator import async_generator, yield_
 from asyncio import sleep
 
@@ -62,8 +61,6 @@ class DockerSpawner(Spawner):
 
     _executor = None
 
-    log_generator = None
-
     @property
     def executor(self):
         """single global executor"""
@@ -71,6 +68,18 @@ class DockerSpawner(Spawner):
         if cls._executor is None:
             cls._executor = ThreadPoolExecutor(1)
         return cls._executor
+
+    _build_executor = None
+
+    @property
+    def build_executor(self):
+        """single global executor"""
+        cls = self.__class__
+        if cls._build_executor is None:
+            cls._build_executor = ThreadPoolExecutor(5)
+        return cls._build_executor
+
+    log_generator = None
 
     _client = None
 
@@ -898,7 +907,6 @@ class DockerSpawner(Spawner):
     def _get_ssl_alt_names(self):
         return ['DNS:' + self.internal_hostname]
 
-    @gen.coroutine
     def build_r2d(self, repourl, ref):
 
         class MyLogGen(object):
@@ -919,16 +927,17 @@ class DockerSpawner(Spawner):
             def push(self, progress, logline):
                 self.loglines.append({'progress': int(progress), 'message': logline})
 
+        self.log.info("Make MyLogGen")
+
         self.log_generator = MyLogGen()
 
         r2d_image_name = "jupyter/repo2docker:0.10.0"
 
         self.log_generator.push(1, 'Creating repo2docker container {} for repo {} and ref {}'.format(r2d_image_name, repourl, ref))
 
-        old_pull_policy = self.pull_policy
-        self.pull_policy = 'ifnotpresent'
-        self.pull_image(r2d_image_name)
-        self.pull_policy = old_pull_policy
+        self.log.info("Make pull")
+
+        self.pull_build_image(r2d_image_name)
 
         host_config = {
             'binds': {
@@ -951,7 +960,7 @@ class DockerSpawner(Spawner):
 
         r2d_cmd.extend(['--user-name=jovyan', '--user-id=1000', repourl])
 
-        container = yield self.docker('create_container',
+        container = self._docker('create_container',
                                       image=r2d_image_name,
                                       host_config=host_config,
                                       command=r2d_cmd,
@@ -961,7 +970,7 @@ class DockerSpawner(Spawner):
 
         self.log_generator.push(1, 'Starting repo2docker container')
 
-        self.docker('start', container_id)
+        self._docker('start', container_id)
 
         self.log.info(
             "r2d Container %s for %s",
@@ -971,26 +980,26 @@ class DockerSpawner(Spawner):
         self.log_generator.push(1, 'Connecting to repo2docker container logs')
 
         # Track logs pretty much to the end, but the stream might break before truly finished
-        docker_log_gen = yield self.docker('logs', container_id, stream=True, follow=True)
+        docker_log_gen = self._docker('logs', container_id, stream=True, follow=True)
 
         self.log.info('Got docker log gen')
 
-        image_name = yield self.wrap_follow_logs(docker_log_gen)
+        image_name = self.follow_logs(docker_log_gen)
 
         self.log.info('Returned wrap_follow_logs')
 
-        retval = yield self.docker('wait', container_id)
+        retval = self._docker('wait', container_id)
 
         statuscode = retval['StatusCode']
 
         if statuscode == 0 and image_name == '':
             self.log.info('TRYING TAIL LOGS to get image name')
             # We didn't pick up an image name, so try again with fixed logs at the end
-            docker_log_gen = yield self.docker('logs', container_id, stream=False, follow=False, tail=5)
+            docker_log_gen = self._docker('logs', container_id, stream=False, follow=False, tail=5)
             docker_log_gen = docker_log_gen.decode('utf-8').split("\n")
-            image_name = yield self.wrap_follow_logs(docker_log_gen, track_progress=False)
+            image_name = self.follow_logs(docker_log_gen, track_progress=False)
 
-        yield self.docker('remove_container', container_id)
+        self._docker('remove_container', container_id)
 
         self.log.info(
             "Awaited r2d Container %s for %s StatusCode %d",
@@ -1001,10 +1010,6 @@ class DockerSpawner(Spawner):
             raise Exception('repo2docker did not provide a name for the image within its logs')
 
         return image_name
-
-    def wrap_follow_logs(self, docker_log_gen, track_progress=True):
-        # Maybe too lightweight, and certainly doesn't need to make docker calls on yet another thread
-        return self.executor.submit(self.follow_logs, docker_log_gen, track_progress)
 
     def follow_logs(self, docker_log_gen, track_progress=True):
 
@@ -1210,6 +1215,29 @@ class DockerSpawner(Spawner):
                 self.log.info("pulling image %s", image)
                 yield self.docker('pull', repo, tag)
 
+    def pull_build_image(self, image):
+        """Pull the image, ifnotpresent
+        Pull on this thread
+        """
+        # docker wants to split repo:tag
+        # the part split("/")[-1] allows having an image from a custom repo
+        # with port but without tag. For example: my.docker.repo:51150/foo would not
+        # pass this test, resulting in image=my.docker.repo:51150/foo and tag=latest
+        if ':' in image.split("/")[-1]:
+            # rsplit splits from right to left, allowing to have a custom image repo with port
+            repo, tag = image.rsplit(':', 1)
+        else:
+            repo = image
+            tag = 'latest'
+
+        try:
+            # check if the image is present
+            self._docker('inspect_image', image)
+        except docker.errors.NotFound:
+            # not present, pull it for the first time
+            self.log.info("pulling image %s", image)
+            self._docker('pull', repo, tag)
+
     @gen.coroutine
     def start(self, image=None, extra_create_kwargs=None, extra_host_config=None):
         """Start the single-user server in a docker container.
@@ -1253,7 +1281,17 @@ class DockerSpawner(Spawner):
 
             self.cmd = 'jupyterhub-singleuser'
 
-            self.image = yield self.build_r2d(repourl, ref)
+            #self.image = yield self.build_r2d(repourl, ref)
+
+            self.log.info('about to build future')
+
+            build_future = yield self.build_executor.submit(self.build_r2d, repourl, ref)
+            self.log.info(build_future)
+
+            #wait([build_future])
+            image_name = build_future #.result()
+            self.log.info(image_name)
+            self.image = image_name
 
         else:
 
